@@ -1,7 +1,7 @@
 import { Alchemy, Network } from "alchemy-sdk";
 import { Pool } from "pg";
 import * as dotenv from "dotenv";
-import { initializeTWAPState, updateTWAPState } from "./db";
+import { initializeTWAPState, updateBlockAndTWAPStates } from "./db";
 
 dotenv.config();
 
@@ -32,14 +32,6 @@ const TWAP_RANGES = {
   THIRTY_DAYS: 30 * 24 * 60 * 60,
 } as const;
 
-// Remove the TWAPInitStatus interface and variable since we'll use the database
-interface TWAPState {
-  weightedSum: number;
-  totalSeconds: number;
-  twapValue: number;
-  lastBlockNumber: number;
-  lastBlockTimestamp: number;
-}
 
 const INITIAL_BLOCK = process.env.INITIAL_BLOCK ? 
   parseInt(process.env.INITIAL_BLOCK) : 
@@ -48,34 +40,8 @@ const INITIAL_BLOCK = process.env.INITIAL_BLOCK ?
 let isShuttingDown = false;
 
 async function getInitialState(): Promise<number> {
-  // If INITIAL_BLOCK is set, and there's no existing state, use it
-  console.log('INITIAL_BLOCK:', INITIAL_BLOCK);
-  if (INITIAL_BLOCK > 0) {
-    const query = `
-      SELECT COUNT(*) as count
-      FROM twap_state 
-      WHERE NOT is_confirmed
-    `;
-    
-    const result = await pool.query(query);
-    console.log('Current state count:', result.rows[0].count);
-    
-    if (Number(result.rows[0].count) === 0) {
-      console.log(`No existing state found, initializing with INITIAL_BLOCK: ${INITIAL_BLOCK}`);
-      await Promise.all([
-        initializeTWAPState(pool, 'twelve_min', INITIAL_BLOCK),
-        initializeTWAPState(pool, 'three_hour', INITIAL_BLOCK),
-        initializeTWAPState(pool, 'thirty_day', INITIAL_BLOCK)
-      ]);
-      
-      return INITIAL_BLOCK;
-    } else {
-      console.log('Found existing state, using last processed block');
-    }
-  }
-
-  // If we have existing state, get the most recent unconfirmed state
-  const query = `
+  // First check if we have any unconfirmed TWAP state
+  const twapStateQuery = `
     SELECT last_block_number 
     FROM twap_state 
     WHERE NOT is_confirmed 
@@ -83,21 +49,38 @@ async function getInitialState(): Promise<number> {
     LIMIT 1
   `;
 
-  const result = await pool.query(query);
+  const twapResult = await pool.query(twapStateQuery);
   
-  if (result.rows.length > 0) {
-    // Resume from the last processed block
-    return result.rows[0].last_block_number;
+  if (twapResult.rows.length > 0) {
+    // Resume from the last processed block in TWAP state
+    console.log("RESUME",twapResult.rows[0].last_block_number);
+    return twapResult.rows[0].last_block_number;
   }
 
-  // If no state exists and no INITIAL_BLOCK set, start from 0
+  // If no TWAP state exists, find the highest confirmed block
+  const confirmedBlockQuery = `
+    SELECT block_number 
+    FROM blocks 
+    WHERE is_confirmed = true 
+    ORDER BY block_number DESC 
+    LIMIT 1
+  `;
+
+  const blockResult = await pool.query(confirmedBlockQuery);
+  const startBlock = blockResult.rows.length > 0 ? 
+    Number(blockResult.rows[0].block_number) + 1 : 
+    Number(INITIAL_BLOCK);
+
+  console.log(`No TWAP state found. Starting from block ${startBlock}`);
+
+  // Initialize TWAP states with the starting block
   await Promise.all([
-    initializeTWAPState(pool, 'twelve_min', INITIAL_BLOCK),
-    initializeTWAPState(pool, 'three_hour', INITIAL_BLOCK),
-    initializeTWAPState(pool, 'thirty_day', INITIAL_BLOCK)
+    initializeTWAPState(pool, 'twelve_min', startBlock),
+    initializeTWAPState(pool, 'three_hour', startBlock),
+    initializeTWAPState(pool, 'thirty_day', startBlock)
   ]);
 
-  return 0;
+  return startBlock;
 }
 
 async function calculateTWAP(
@@ -164,8 +147,9 @@ async function calculateTWAP(
 
 async function handleNewBlock(blockNumber: number) {
   try {
-    const block = await alchemy.core.getBlock(blockNumber);
+    const block = await alchemy.core.getBlockWithTransactions(blockNumber);
     if (!block.baseFeePerGas) {
+      console.log(block);
       console.log(`Block ${blockNumber} has no base fee, skipping`);
       return;
     }
@@ -184,52 +168,13 @@ async function handleNewBlock(blockNumber: number) {
       calculateTWAP(pool, TWAP_RANGES.THIRTY_DAYS, currentBlock),
     ]);
 
-    await pool.query('BEGIN');
+    await updateBlockAndTWAPStates(pool, blockNumber, block.timestamp, basefee, {
+      twelveMin,
+      threeHour,
+      thirtyDay
+    });
 
-    try {
-      // Store block with TWAPs
-      await pool.query(`
-        INSERT INTO blocks (
-          block_number, timestamp, basefee, is_confirmed,
-          twelve_min_twap, three_hour_twap, thirty_day_twap
-        ) VALUES ($1, $2, $3, false, $4, $5, $6)
-        ON CONFLICT (block_number) 
-        DO UPDATE SET 
-          basefee = EXCLUDED.basefee,
-          timestamp = EXCLUDED.timestamp,
-          twelve_min_twap = EXCLUDED.twelve_min_twap,
-          three_hour_twap = EXCLUDED.three_hour_twap,
-          thirty_day_twap = EXCLUDED.thirty_day_twap
-        WHERE NOT blocks.is_confirmed
-        RETURNING *
-      `, [
-        blockNumber,
-        block.timestamp,
-        basefee,
-        twelveMin.twap,
-        threeHour.twap,
-        thirtyDay.twap,
-      ]);
-
-      // Update TWAP states
-      await Promise.all([
-        updateTWAPState(pool, 'twelve_min', twelveMin, blockNumber, block.timestamp),
-        updateTWAPState(pool, 'three_hour', threeHour, blockNumber, block.timestamp),
-        updateTWAPState(pool, 'thirty_day', thirtyDay, blockNumber, block.timestamp)
-      ]);
-
-      await pool.query('COMMIT');
-
-      console.log(`Processed block ${blockNumber} with TWAPs:`, {
-        twelveMinTwap: twelveMin.twap,
-        threeHourTwap: threeHour.twap,
-        thirtyDayTwap: thirtyDay.twap,
-      });
-    } catch (error) {
-      await pool.query('ROLLBACK');
-      console.error('Transaction error:', error);
-      throw error;
-    }
+    console.log(`Processed block ${blockNumber}`);
   } catch (error) {
     console.error(`Error processing block ${blockNumber}:`, error);
     throw error;
@@ -244,15 +189,15 @@ async function main() {
     const currentBlock = await alchemy.core.getBlockNumber();
     
     // Get the last processed block from our state
-    const lastProcessedBlock = await getInitialState();
+    const lastProcessedBlock = Number(await getInitialState());
     console.log(`Last processed block: ${lastProcessedBlock}, Current chain head: ${currentBlock}`);
 
     // Catch up on missing blocks
-    if (lastProcessedBlock < currentBlock) {
+    if (lastProcessedBlock < Number(currentBlock)) {
       console.log(`Catching up from block ${lastProcessedBlock + 1} to ${currentBlock}`);
       
       // Process blocks sequentially
-      for (let blockNumber = Number(lastProcessedBlock) + 1; blockNumber <= currentBlock; blockNumber++) {
+      for (let blockNumber = lastProcessedBlock; blockNumber <= currentBlock; blockNumber++) {
         try {
           console.log(`Processing block ${blockNumber}`);
           await handleNewBlock(blockNumber);
