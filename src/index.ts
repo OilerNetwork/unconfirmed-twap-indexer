@@ -9,6 +9,13 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+const fossilPool = new Pool({
+  connectionString: process.env.FOSSIL_DB_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 const config = {
   apiKey: process.env.ALCHEMY_API_KEY,
   network: Network.ETH_MAINNET,
@@ -75,9 +82,9 @@ async function getInitialState(): Promise<number> {
 
   // Initialize TWAP states with the starting block
   await Promise.all([
-    initializeTWAPState(pool, 'twelve_min', startBlock),
-    initializeTWAPState(pool, 'three_hour', startBlock),
-    initializeTWAPState(pool, 'thirty_day', startBlock)
+    initializeTWAPState(pool, fossilPool, 'twelve_min', startBlock),
+    initializeTWAPState(pool, fossilPool, 'three_hour', startBlock),
+    initializeTWAPState(pool, fossilPool, 'thirty_day', startBlock)
   ]);
 
   return startBlock;
@@ -167,7 +174,7 @@ async function handleNewBlock(blockNumber: number): Promise<boolean> {
       calculateTWAP(pool, TWAP_RANGES.THIRTY_DAYS, currentBlock),
     ]);
 
-    const result = await updateBlockAndTWAPStates(pool, blockNumber, block.timestamp, basefee, {
+    const result = await updateBlockAndTWAPStates(pool, fossilPool, blockNumber, block.timestamp, basefee, {
       twelveMin,
       threeHour,
       thirtyDay
@@ -177,9 +184,9 @@ async function handleNewBlock(blockNumber: number): Promise<boolean> {
       console.log(`Found confirmed block ${blockNumber}, recalibrating to start from ${result.nextStartBlock}`);
       // Reinitialize TWAP states with new starting block
       await Promise.all([
-        initializeTWAPState(pool, 'twelve_min', result.nextStartBlock),
-        initializeTWAPState(pool, 'three_hour', result.nextStartBlock),
-        initializeTWAPState(pool, 'thirty_day', result.nextStartBlock)
+        initializeTWAPState(pool, fossilPool, 'twelve_min', result.nextStartBlock),
+        initializeTWAPState(pool, fossilPool, 'three_hour', result.nextStartBlock),
+        initializeTWAPState(pool, fossilPool, 'thirty_day', result.nextStartBlock)
       ]);
       return true; // Signal that we need to recalibrate
     }
@@ -246,6 +253,7 @@ async function shutdown() {
   console.log('Closing database pool...');
   try {
     await pool.end();
+    await fossilPool.end();
     console.log('Database pool closed');
   } catch (error) {
     console.error('Error closing database pool:', error);

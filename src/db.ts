@@ -1,10 +1,32 @@
 import { Pool } from "pg";
 
+// Add a function to get the latest block from FOSSIL DB
+async function getLatestFossilBlock(fossilPool: Pool): Promise<number> {
+  const result = await fossilPool.query(`
+    SELECT number AS block_number
+    FROM blockheaders
+    ORDER BY number DESC
+    LIMIT 1
+  `);
+
+  if (result.rows.length === 0) {
+    throw new Error('No blocks found in FOSSIL DB');
+  }
+
+  return Number(result.rows[0].block_number);
+}
+
 export async function initializeTWAPState(
-  pool: Pool, 
+  pool: Pool,
+  fossilPool: Pool, 
   windowType: string, 
-  initialBlock: number
+  initialBlock?: number // Make initialBlock optional
 ): Promise<void> {
+  // If no initialBlock provided, get it from FOSSIL DB
+  if (!initialBlock) {
+    initialBlock = await getLatestFossilBlock(fossilPool);
+  }
+  
   await pool.query(`
     INSERT INTO twap_state (
       window_type, 
@@ -21,6 +43,7 @@ export async function initializeTWAPState(
 
 export async function updateBlockAndTWAPStates(
   pool: Pool,
+  fossilPool: Pool,
   blockNumber: number,
   timestamp: number,
   basefee: number,
@@ -40,29 +63,21 @@ export async function updateBlockAndTWAPStates(
     `, [blockNumber]);
 
     if (checkResult.rows.length > 0) {
-      // Block is already confirmed, need to recalibrate
-      const latestConfirmedBlock = await pool.query(`
-        SELECT block_number 
-        FROM blocks 
-        WHERE is_confirmed = true 
-        ORDER BY block_number DESC 
-        LIMIT 1
-      `);
+      // Block is already confirmed, get latest block from FOSSIL DB
+      const latestBlock = await getLatestFossilBlock(fossilPool);
 
-      if (latestConfirmedBlock.rows.length > 0) {
-        // Delete all unconfirmed TWAP states before recalibrating
-        await pool.query(`
-          DELETE FROM twap_state 
-          WHERE NOT is_confirmed
-        `);
-        
-        await pool.query('COMMIT');
-        
-        return {
-          shouldRecalibrate: true,
-          nextStartBlock: Number(latestConfirmedBlock.rows[0].block_number) + 1
-        };
-      }
+      // Delete all unconfirmed TWAP states before recalibrating
+      await pool.query(`
+        DELETE FROM twap_state 
+        WHERE NOT is_confirmed
+      `);
+      
+      await pool.query('COMMIT');
+      
+      return {
+        shouldRecalibrate: true,
+        nextStartBlock: latestBlock + 1
+      };
     }
 
     // If not confirmed, proceed with normal update
