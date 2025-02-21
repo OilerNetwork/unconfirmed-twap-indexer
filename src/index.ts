@@ -145,13 +145,12 @@ async function calculateTWAP(
   };
 }
 
-async function handleNewBlock(blockNumber: number) {
+async function handleNewBlock(blockNumber: number): Promise<boolean> {
   try {
     const block = await alchemy.core.getBlockWithTransactions(blockNumber);
     if (!block.baseFeePerGas) {
-      console.log(block);
       console.log(`Block ${blockNumber} has no base fee, skipping`);
-      return;
+      return false;
     }
 
     const basefee = Number(block.baseFeePerGas.toString());
@@ -168,13 +167,25 @@ async function handleNewBlock(blockNumber: number) {
       calculateTWAP(pool, TWAP_RANGES.THIRTY_DAYS, currentBlock),
     ]);
 
-    await updateBlockAndTWAPStates(pool, blockNumber, block.timestamp, basefee, {
+    const result = await updateBlockAndTWAPStates(pool, blockNumber, block.timestamp, basefee, {
       twelveMin,
       threeHour,
       thirtyDay
     });
 
+    if (result.shouldRecalibrate && result.nextStartBlock) {
+      console.log(`Found confirmed block ${blockNumber}, recalibrating to start from ${result.nextStartBlock}`);
+      // Reinitialize TWAP states with new starting block
+      await Promise.all([
+        initializeTWAPState(pool, 'twelve_min', result.nextStartBlock),
+        initializeTWAPState(pool, 'three_hour', result.nextStartBlock),
+        initializeTWAPState(pool, 'thirty_day', result.nextStartBlock)
+      ]);
+      return true; // Signal that we need to recalibrate
+    }
+
     console.log(`Processed block ${blockNumber}`);
+    return false;
   } catch (error) {
     console.error(`Error processing block ${blockNumber}:`, error);
     throw error;
@@ -200,13 +211,14 @@ async function main() {
       for (let blockNumber = lastProcessedBlock; blockNumber <= currentBlock; blockNumber++) {
         try {
           console.log(`Processing block ${blockNumber}`);
-          await handleNewBlock(blockNumber);
-          if (blockNumber % 10 === 0) {
-            console.log(`Processed block ${blockNumber}`);
+          const needsRecalibration = await handleNewBlock(blockNumber);
+          if (needsRecalibration) {
+            // Start over from getInitialState
+            return main();
           }
         } catch (error) {
           console.error(`Error processing block ${blockNumber}:`, error);
-          throw error; // Stop processing on error
+          throw error;
         }
       }
       console.log('Caught up with historical blocks');
