@@ -1,4 +1,4 @@
-import { Alchemy, Network } from "alchemy-sdk";
+import { Alchemy, Network, Block as AlchemyBlock } from "alchemy-sdk";
 import { Pool } from "pg";
 import * as dotenv from "dotenv";
 import { initializeTWAPState, updateBlockAndTWAPStates } from "./db";
@@ -60,7 +60,6 @@ async function getInitialState(): Promise<number> {
   
   if (twapResult.rows.length > 0) {
     // Resume from the last processed block in TWAP state
-    console.log("RESUME",twapResult.rows[0].last_block_number);
     return twapResult.rows[0].last_block_number;
   }
 
@@ -82,9 +81,9 @@ async function getInitialState(): Promise<number> {
 
   // Initialize TWAP states with the starting block
   await Promise.all([
-    initializeTWAPState(pool, fossilPool, 'twelve_min', startBlock),
-    initializeTWAPState(pool, fossilPool, 'three_hour', startBlock),
-    initializeTWAPState(pool, fossilPool, 'thirty_day', startBlock)
+    initializeTWAPState(pool,  'twelve_min', startBlock),
+    initializeTWAPState(pool,  'three_hour', startBlock),
+    initializeTWAPState(pool,  'thirty_day', startBlock)
   ]);
 
   return startBlock;
@@ -152,17 +151,16 @@ async function calculateTWAP(
   };
 }
 
-async function handleNewBlock(blockNumber: number): Promise<boolean> {
+async function handleNewBlock(block:AlchemyBlock): Promise<boolean> {
   try {
-    const block = await alchemy.core.getBlockWithTransactions(blockNumber);
     if (!block.baseFeePerGas) {
-      console.log(`Block ${blockNumber} has no base fee, skipping`);
+      console.log(`Block ${block.number} has no base fee, skipping`);
       return false;
     }
 
     const basefee = Number(block.baseFeePerGas.toString());
     const currentBlock = {
-      number: blockNumber,
+      number: block.number,
       timestamp: block.timestamp,
       basefee: basefee
     };
@@ -174,29 +172,37 @@ async function handleNewBlock(blockNumber: number): Promise<boolean> {
       calculateTWAP(pool, TWAP_RANGES.THIRTY_DAYS, currentBlock),
     ]);
 
-    const result = await updateBlockAndTWAPStates(pool, fossilPool, blockNumber, block.timestamp, basefee, {
+    const result = await updateBlockAndTWAPStates(pool, fossilPool, block.number, block.timestamp, basefee, {
       twelveMin,
       threeHour,
       thirtyDay
     });
 
     if (result.shouldRecalibrate && result.nextStartBlock) {
-      console.log(`Found confirmed block ${blockNumber}, recalibrating to start from ${result.nextStartBlock}`);
+      console.log(`Found confirmed block ${block.number}, recalibrating to start from ${result.nextStartBlock}`);
       // Reinitialize TWAP states with new starting block
       await Promise.all([
-        initializeTWAPState(pool, fossilPool, 'twelve_min', result.nextStartBlock),
-        initializeTWAPState(pool, fossilPool, 'three_hour', result.nextStartBlock),
-        initializeTWAPState(pool, fossilPool, 'thirty_day', result.nextStartBlock)
+        initializeTWAPState(pool, 'twelve_min', result.nextStartBlock),
+        initializeTWAPState(pool, 'three_hour', result.nextStartBlock),
+        initializeTWAPState(pool, 'thirty_day', result.nextStartBlock)
       ]);
       return true; // Signal that we need to recalibrate
     }
 
-    console.log(`Processed block ${blockNumber}`);
+    console.log(`Processed block ${block.number}`);
     return false;
   } catch (error) {
-    console.error(`Error processing block ${blockNumber}:`, error);
+    console.error(`Error processing block ${block.number}:`, error);
     throw error;
   }
+}
+
+// Add retry logic at the top
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function main() {
@@ -204,7 +210,7 @@ async function main() {
     console.log("Starting block watcher...");
     
     // Get current chain head
-    const currentBlock = await alchemy.core.getBlockNumber();
+    let currentBlock = await alchemy.core.getBlockNumber();
     
     // Get the last processed block from our state
     const lastProcessedBlock = Number(await getInitialState());
@@ -214,18 +220,43 @@ async function main() {
     if (lastProcessedBlock < Number(currentBlock)) {
       console.log(`Catching up from block ${lastProcessedBlock + 1} to ${currentBlock}`);
       
-      // Process blocks sequentially
-      for (let blockNumber = lastProcessedBlock; blockNumber <= currentBlock; blockNumber++) {
+      let blockNumber = lastProcessedBlock;
+      while (blockNumber < currentBlock) {
         try {
-          console.log(`Processing block ${blockNumber}`);
-          const needsRecalibration = await handleNewBlock(blockNumber);
-          if (needsRecalibration) {
-            // Start over from getInitialState
-            return main();
+          const length = Math.min(currentBlock - blockNumber, 1000);
+          console.log("LENGTH", length);
+          const promises = Array.from({length}, async (_, i) => {
+          console.log("BLOCK NUMBER", blockNumber + i);
+            const block = await alchemy.core.getBlock(blockNumber + i);
+            return block;
+          });
+          const blocks = await Promise.all(promises);
+          blocks.sort((a, b) => a.number - b.number);
+          blocks.forEach(block => {
+            console.log("BLOCK", block.number);
+          });
+
+          for (const block of blocks) {
+            while (true) {
+              try {
+                const needsRecalibration = await handleNewBlock(block);
+                if (needsRecalibration) {
+                  return main(); // Start over from getInitialState
+                }
+                break; // Success, move to next block
+              } catch (error) {
+                console.error(`Error processing block ${block.number}, retrying:`, error);
+                await sleep(1000); // Wait a second before retrying
+              }
+            }
           }
+          
+          currentBlock = await alchemy.core.getBlockNumber();
+          blockNumber += length;
         } catch (error) {
-          console.error(`Error processing block ${blockNumber}:`, error);
-          throw error;
+          console.error(`Error fetching blocks at ${blockNumber}:`, error);
+          await sleep(1000); // Wait before retrying the batch
+          continue;
         }
       }
       console.log('Caught up with historical blocks');
@@ -233,16 +264,34 @@ async function main() {
 
     // Now start watching for new blocks
     console.log('Starting real-time block watching');
-    alchemy.ws.on("block", async (blockNumber) => {
-      try {
-        await handleNewBlock(blockNumber);
-      } catch (error) {
-        console.error(`Error processing block ${blockNumber}:`, error);
-      }
-    });
+    
+    // Create a reference to keep the process alive
+    
+    console.log("REACHED HERE");
+      alchemy.ws.on("block", async (blockNumber) => {
+        while (true) {
+          try {
+            const block = await alchemy.core.getBlock(blockNumber);
+            console.log("BLOCK", block.number);
+            await handleNewBlock(block);
+            break;
+          } catch (error) {
+            console.error(`Error processing block ${blockNumber}, retrying:`, error);
+            await sleep(1000);
+          }
+        }
+      });
+      // Clean up on shutdown
+      process.once('SIGINT', () => {
+        shutdown();
+      });
+      process.once('SIGTERM', () => {
+        shutdown();
+      });
+
   } catch (error) {
     console.error("Error starting watcher:", error);
-    process.exit(1);
+    throw error;
   }
 }
 
@@ -260,9 +309,6 @@ async function shutdown() {
   }
   process.exit(0);
 }
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
 
 main().catch((error) => {
   console.error("Error in main:", error);

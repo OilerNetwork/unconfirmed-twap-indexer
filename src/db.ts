@@ -18,15 +18,9 @@ async function getLatestFossilBlock(fossilPool: Pool): Promise<number> {
 
 export async function initializeTWAPState(
   pool: Pool,
-  fossilPool: Pool, 
   windowType: string, 
   initialBlock?: number // Make initialBlock optional
 ): Promise<void> {
-  // If no initialBlock provided, get it from FOSSIL DB
-  if (!initialBlock) {
-    initialBlock = await getLatestFossilBlock(fossilPool);
-  }
-  
   await pool.query(`
     INSERT INTO twap_state (
       window_type, 
@@ -64,7 +58,16 @@ export async function updateBlockAndTWAPStates(
 
     if (checkResult.rows.length > 0) {
       // Block is already confirmed, get latest block from FOSSIL DB
-      const latestBlock = await getLatestFossilBlock(fossilPool);
+      const latestFossilBlock = await fossilPool.query(`
+        SELECT number AS block_number
+        FROM blockheaders
+        ORDER BY number DESC
+        LIMIT 1
+      `);
+
+      if (latestFossilBlock.rows.length === 0) {
+        throw new Error('No blocks found in FOSSIL DB for recalibration');
+      }
 
       // Delete all unconfirmed TWAP states before recalibrating
       await pool.query(`
@@ -76,24 +79,28 @@ export async function updateBlockAndTWAPStates(
       
       return {
         shouldRecalibrate: true,
-        nextStartBlock: latestBlock + 1
+        nextStartBlock: Number(latestFossilBlock.rows[0].block_number) + 1
       };
     }
 
     // If not confirmed, proceed with normal update
-    await pool.query(`
-      INSERT INTO blocks (
-        block_number, timestamp, basefee, is_confirmed,
-        twelve_min_twap, three_hour_twap, thirty_day_twap
-      ) VALUES ($1, $2, $3, false, $4, $5, $6)
-      ON CONFLICT (block_number) 
-      DO UPDATE SET 
-        basefee = EXCLUDED.basefee,
-        timestamp = EXCLUDED.timestamp,
-        twelve_min_twap = EXCLUDED.twelve_min_twap,
-        three_hour_twap = EXCLUDED.three_hour_twap,
-        thirty_day_twap = EXCLUDED.thirty_day_twap
-      WHERE NOT blocks.is_confirmed
+    const blockInsertResult = await pool.query(`
+      WITH block_update AS (
+        INSERT INTO blocks (
+          block_number, timestamp, basefee, is_confirmed,
+          twelve_min_twap, three_hour_twap, thirty_day_twap
+        ) VALUES ($1, $2, $3, false, $4, $5, $6)
+        ON CONFLICT (block_number) 
+        DO UPDATE SET 
+          basefee = EXCLUDED.basefee,
+          timestamp = EXCLUDED.timestamp,
+          twelve_min_twap = EXCLUDED.twelve_min_twap,
+          three_hour_twap = EXCLUDED.three_hour_twap,
+          thirty_day_twap = EXCLUDED.thirty_day_twap
+        WHERE NOT blocks.is_confirmed
+        RETURNING blocks.is_confirmed
+      )
+      SELECT * FROM block_update
     `, [
       blockNumber,
       timestamp,
@@ -103,9 +110,35 @@ export async function updateBlockAndTWAPStates(
       twaps.thirtyDay.twap,
     ]);
 
+    // If the block was confirmed, trigger recalibration
+    if (blockInsertResult.rows.length === 0 || blockInsertResult.rows[0].is_confirmed) {
+      const latestFossilBlock = await fossilPool.query(`
+        SELECT number AS block_number
+        FROM blockheaders
+        ORDER BY number DESC
+        LIMIT 1
+      `);
+
+      if (latestFossilBlock.rows.length === 0) {
+        throw new Error('No blocks found in FOSSIL DB for recalibration');
+      }
+
+      // Delete all unconfirmed TWAP states before recalibrating
+      await pool.query(`
+        DELETE FROM twap_state 
+        WHERE NOT is_confirmed
+      `);
+      
+      await pool.query('COMMIT');
+      
+      return {
+        shouldRecalibrate: true,
+        nextStartBlock: Number(latestFossilBlock.rows[0].block_number) + 1
+      };
+    }
+
     // Update TWAP states
-    await pool.query(`
-      INSERT INTO twap_state (window_type, weighted_sum, total_seconds, twap_value, last_block_number, last_block_timestamp, is_confirmed)
+    await pool.query(`      INSERT INTO twap_state (window_type, weighted_sum, total_seconds, twap_value, last_block_number, last_block_timestamp, is_confirmed)
       VALUES 
         ($1, $2, $3, $4, $5, $6, false),
         ($7, $8, $9, $10, $5, $6, false),
@@ -132,4 +165,3 @@ export async function updateBlockAndTWAPStates(
     throw error;
   }
 }
-
