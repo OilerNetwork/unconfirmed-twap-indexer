@@ -1,7 +1,7 @@
-import { Pool } from "pg";
+import { PoolClient, Pool } from "pg";
 
 // Add a function to get the latest block from FOSSIL DB
-async function getLatestFossilBlock(fossilPool: Pool): Promise<number> {
+export async function getLatestFossilBlock(fossilPool: Pool): Promise<number> {
   const result = await fossilPool.query(`
     SELECT number AS block_number
     FROM blockheaders
@@ -10,18 +10,20 @@ async function getLatestFossilBlock(fossilPool: Pool): Promise<number> {
   `);
 
   if (result.rows.length === 0) {
-    throw new Error('No blocks found in FOSSIL DB');
+    return 0;
   }
 
   return Number(result.rows[0].block_number);
 }
 
+// This function is no longer needed as we're using direct parameterized queries instead of prepared statements
 export async function initializeTWAPState(
-  pool: Pool,
-  windowType: string, 
-  initialBlock?: number // Make initialBlock optional
+  client: PoolClient,
+  windowType: string,
+  initialBlock: number
 ): Promise<void> {
-  await pool.query(`
+  await client.query(
+    `
     INSERT INTO twap_state (
       window_type, 
       weighted_sum,
@@ -29,15 +31,22 @@ export async function initializeTWAPState(
       twap_value,
       last_block_number, 
       last_block_timestamp, 
-      is_confirmed
-    ) VALUES ($1, $2, $3, $4, $5, $6, false)
-    ON CONFLICT ON CONSTRAINT twap_state_window_type_is_confirmed_key DO NOTHING
-  `, [windowType, 0, 0, 0, initialBlock, 0]);
+      is_confirmed    
+    ) VALUES ($1::twap_window_type, $2, $3, $4, $5, $6, false)
+    ON CONFLICT ON CONSTRAINT twap_state_window_type_is_confirmed_key DO UPDATE SET
+      weighted_sum = EXCLUDED.weighted_sum,
+      total_seconds = EXCLUDED.total_seconds,
+      twap_value = EXCLUDED.twap_value,
+      last_block_number = EXCLUDED.last_block_number,
+      last_block_timestamp = EXCLUDED.last_block_timestamp,
+      is_confirmed = false
+  `,
+    [windowType, 0, 0, 0, initialBlock, 0]
+  );
 }
 
 export async function updateBlockAndTWAPStates(
-  pool: Pool,
-  fossilPool: Pool,
+  client: PoolClient,
   blockNumber: number,
   timestamp: number,
   basefee: number,
@@ -46,45 +55,13 @@ export async function updateBlockAndTWAPStates(
     threeHour: { weightedSum: number; totalSeconds: number; twap: number };
     thirtyDay: { weightedSum: number; totalSeconds: number; twap: number };
   }
-): Promise<{ shouldRecalibrate: boolean; nextStartBlock?: number }> {
-  await pool.query('BEGIN');
-  
+): Promise<{ shouldRecalibrate: boolean }> {
+  await client.query("BEGIN");
+
   try {
-    // First check if this block is already confirmed
-    const checkResult = await pool.query(`
-      SELECT is_confirmed FROM blocks 
-      WHERE block_number = $1 AND is_confirmed = true
-    `, [blockNumber]);
-
-    if (checkResult.rows.length > 0) {
-      // Block is already confirmed, get latest block from FOSSIL DB
-      const latestFossilBlock = await fossilPool.query(`
-        SELECT number AS block_number
-        FROM blockheaders
-        ORDER BY number DESC
-        LIMIT 1
-      `);
-
-      if (latestFossilBlock.rows.length === 0) {
-        throw new Error('No blocks found in FOSSIL DB for recalibration');
-      }
-
-      // Delete all unconfirmed TWAP states before recalibrating
-      await pool.query(`
-        DELETE FROM twap_state 
-        WHERE NOT is_confirmed
-      `);
-      
-      await pool.query('COMMIT');
-      
-      return {
-        shouldRecalibrate: true,
-        nextStartBlock: Number(latestFossilBlock.rows[0].block_number) + 1
-      };
-    }
-
-    // If not confirmed, proceed with normal update
-    const blockInsertResult = await pool.query(`
+    // Use direct parameterized query instead of prepared statement
+    const blockInsertResult = await client.query(
+      `
       WITH block_update AS (
         INSERT INTO blocks (
           block_number, timestamp, basefee, is_confirmed,
@@ -101,48 +78,36 @@ export async function updateBlockAndTWAPStates(
         RETURNING blocks.is_confirmed
       )
       SELECT * FROM block_update
-    `, [
-      blockNumber,
-      timestamp,
-      basefee,
-      twaps.twelveMin.twap,
-      twaps.threeHour.twap,
-      twaps.thirtyDay.twap,
-    ]);
+      `,
+      [
+        blockNumber,
+        timestamp,
+        basefee,
+        twaps.twelveMin.twap,
+        twaps.threeHour.twap,
+        twaps.thirtyDay.twap,
+      ]
+    );
 
     // If the block was confirmed, trigger recalibration
-    if (blockInsertResult.rows.length === 0 || blockInsertResult.rows[0].is_confirmed) {
-      const latestFossilBlock = await fossilPool.query(`
-        SELECT number AS block_number
-        FROM blockheaders
-        ORDER BY number DESC
-        LIMIT 1
-      `);
-
-      if (latestFossilBlock.rows.length === 0) {
-        throw new Error('No blocks found in FOSSIL DB for recalibration');
-      }
-
-      // Delete all unconfirmed TWAP states before recalibrating
-      await pool.query(`
-        DELETE FROM twap_state 
-        WHERE NOT is_confirmed
-      `);
-      
-      await pool.query('COMMIT');
-      
+    if (
+      blockInsertResult.rows.length === 0 ||
+      blockInsertResult.rows[0].is_confirmed
+    ) {
+      client.query("ROLLBACK");
       return {
         shouldRecalibrate: true,
-        nextStartBlock: Number(latestFossilBlock.rows[0].block_number) + 1
       };
     }
 
-    // Update TWAP states
-    await pool.query(`      INSERT INTO twap_state (window_type, weighted_sum, total_seconds, twap_value, last_block_number, last_block_timestamp, is_confirmed)
+    // Use direct parameterized query for TWAP updates
+    await client.query(
+      `
+      INSERT INTO twap_state (window_type, weighted_sum, total_seconds, twap_value, last_block_number, last_block_timestamp, is_confirmed)
       VALUES 
-        ($1, $2, $3, $4, $5, $6, false),
-        ($7, $8, $9, $10, $5, $6, false),
-        ($11, $12, $13, $14, $5, $6, false)
+        ($1::twap_window_type, $2, $3, $4, $5, $6, false),
+        ($7::twap_window_type, $8, $9, $10, $5, $6, false),
+        ($11::twap_window_type, $12, $13, $14, $5, $6, false)
       ON CONFLICT ON CONSTRAINT twap_state_window_type_is_confirmed_key 
       DO UPDATE SET
         weighted_sum = EXCLUDED.weighted_sum,
@@ -150,18 +115,30 @@ export async function updateBlockAndTWAPStates(
         twap_value = EXCLUDED.twap_value,
         last_block_number = EXCLUDED.last_block_number,
         last_block_timestamp = EXCLUDED.last_block_timestamp
-      WHERE twap_state.is_confirmed = false AND twap_state.window_type = EXCLUDED.window_type
-    `, [
-      'twelve_min', twaps.twelveMin.weightedSum, twaps.twelveMin.totalSeconds, twaps.twelveMin.twap,
-      blockNumber, timestamp,
-      'three_hour', twaps.threeHour.weightedSum, twaps.threeHour.totalSeconds, twaps.threeHour.twap,
-      'thirty_day', twaps.thirtyDay.weightedSum, twaps.thirtyDay.totalSeconds, twaps.thirtyDay.twap
-    ]);
+      WHERE twap_state.is_confirmed = false AND twap_state.window_type = EXCLUDED.window_type::twap_window_type
+      `,
+      [
+        "twelve_min",
+        twaps.twelveMin.weightedSum,
+        twaps.twelveMin.totalSeconds,
+        twaps.twelveMin.twap,
+        blockNumber,
+        timestamp,
+        "three_hour",
+        twaps.threeHour.weightedSum,
+        twaps.threeHour.totalSeconds,
+        twaps.threeHour.twap,
+        "thirty_day",
+        twaps.thirtyDay.weightedSum,
+        twaps.thirtyDay.totalSeconds,
+        twaps.thirtyDay.twap,
+      ]
+    );
 
-    await pool.query('COMMIT');
+    await client.query("COMMIT");
     return { shouldRecalibrate: false };
   } catch (error) {
-    await pool.query('ROLLBACK');
+    await client.query("ROLLBACK");
     throw error;
   }
 }
