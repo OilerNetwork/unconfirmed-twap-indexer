@@ -1,5 +1,4 @@
 import { PoolClient, Pool } from "pg";
-import { Block } from "viem";
 
 export class DB {
   private fossilPool: Pool;
@@ -191,6 +190,7 @@ export class DB {
         blockInsertResult.rows.length === 0 ||
         blockInsertResult.rows[0].is_confirmed
       ) {
+        console.log("HERE")
         client.query("ROLLBACK");
         return {
           shouldRecalibrate: true,
@@ -237,6 +237,8 @@ export class DB {
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
+    } finally {
+      client.release();
     }
   }
 }

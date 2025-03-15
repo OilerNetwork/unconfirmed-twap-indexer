@@ -25,7 +25,9 @@ export class Runner {
     this.db = new DB();
     this.rpcClient = createPublicClient({
       chain: mainnet,
-      transport: http(`https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`),
+      transport: http(
+        `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+      ),
     });
     this.viemClient = createPublicClient({
       chain: mainnet,
@@ -58,35 +60,15 @@ export class Runner {
       );
 
       let blockNumber = Number(lastProcessedBlock);
-      while (blockNumber < currentBlock) {
+      while (blockNumber <= currentBlock) {
         try {
-          const length = Math.min(currentBlock - blockNumber, 1000);
+          const length = Math.min(currentBlock - blockNumber + 1, 1000);
           const blocks = await this.getBlocks(blockNumber, length);
-          for (const block of blocks) {
-            console.log("Block", block.number);
-            while (true) {
-              try {
-                const needsRecalibration = await this.handleNewBlock(block);
-                if (needsRecalibration) {
-                    console.log("THIS")
-                  await this.recalibrate();
-                  return true; // Start over from getInitialState
-                }
-                break; // Success, move to next block
-              } catch (error) {
-                console.error(
-                  `Error processing block ${block.number}, retrying:`,
-                  error
-                );
-                await this.sleep(1000); // Wait a second before retrying
-              }
-            }
-            console.log("BlockDone", block.number);
-          }
+          await this.processBlocks(blocks);
 
           currentBlock = Number(await this.rpcClient.getBlockNumber());
           blockNumber += length;
-          console.log("Current block", currentBlock);
+          console.log("currentBlock, blockNumber", currentBlock, blockNumber);
         } catch (error) {
           console.error(`Error fetching blocks at ${blockNumber}:`, error);
           await this.sleep(1000); // Wait before retrying the batch
@@ -97,6 +79,30 @@ export class Runner {
     return false;
   }
 
+  async processBlocks(blocks: Block[]) {
+    for (const block of blocks) {
+      console.log("Block", block.number);
+      while (true) {
+        try {
+          const needsRecalibration = await this.handleNewBlock(block);
+          console.log("Needs recalibration", needsRecalibration);
+          if (needsRecalibration) {
+            console.log("THIS");
+            await this.recalibrate();
+            return true; // Start over from getInitialState
+          }
+          break; // Success, move to next block
+        } catch (error) {
+          console.error(
+            `Error processing block ${block.number}, retrying:`,
+            error
+          );
+          await this.sleep(1000); // Wait a second before retrying
+        }
+      }
+      console.log("BlockDone", block.number);
+    }
+  }
   async getBlocks(fromBlock: number, length: number): Promise<Block[]> {
     const promises = Array.from({ length }, async (_, i) => {
       const block = await this.rpcClient.getBlock({
@@ -169,7 +175,7 @@ export class Runner {
           thirtyDay,
         }
       );
-
+      console.log("Result", result);
       if (result.shouldRecalibrate) return true; // Signal that we need to recalibrate
 
       console.log(`Processed block ${block.number}`);
