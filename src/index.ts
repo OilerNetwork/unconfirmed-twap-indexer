@@ -5,7 +5,10 @@ dotenv.config();
 async function main() {
   try {
     const runner = new Runner();
-    await runner.initialize();
+    let shouldRecalibrate = true;
+    while(shouldRecalibrate) {
+      shouldRecalibrate = await runner.initialize();
+    }
     runner.startListening();
     // Clean up on shutdown
     process.once("SIGINT", () => {

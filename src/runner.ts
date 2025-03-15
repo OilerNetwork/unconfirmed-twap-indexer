@@ -1,7 +1,13 @@
-import { Block, createPublicClient, webSocket, WatchBlocksReturnType } from "viem";
+import {
+  Block,
+  createPublicClient,
+  http,
+  webSocket,
+  WatchBlocksReturnType,
+} from "viem";
 import { PublicClient } from "viem";
 import { DB } from "./db";
-import { sepolia } from "viem/chains";
+import { mainnet } from "viem/chains";
 
 const TWAP_RANGES = {
   TWELVE_MIN: 12 * 60,
@@ -12,13 +18,20 @@ const TWAP_RANGES = {
 export class Runner {
   private db: DB;
   private viemClient: PublicClient;
+  private rpcClient: PublicClient;
   unwatch: WatchBlocksReturnType | undefined;
 
   constructor() {
     this.db = new DB();
+    this.rpcClient = createPublicClient({
+      chain: mainnet,
+      transport: http(`https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`),
+    });
     this.viemClient = createPublicClient({
-      chain: sepolia,
-      transport: webSocket(`wss://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`),
+      chain: mainnet,
+      transport: webSocket(
+        `wss://eth-sepolia.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+      ),
     });
   }
 
@@ -26,12 +39,12 @@ export class Runner {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async initialize(): Promise<void> {
-    let currentBlock = Number(await this.viemClient.getBlockNumber());
+  async initialize(): Promise<boolean> {
+    let currentBlock = Number(await this.rpcClient.getBlockNumber());
 
-    const lastProcessedBlock = Number(await this.db.getLastProcessedBlock(
-      currentBlock
-    ));
+    const lastProcessedBlock = Number(
+      await this.db.getLastProcessedBlock(currentBlock)
+    );
     // Get the last processed block from our state
 
     console.log(
@@ -44,26 +57,20 @@ export class Runner {
         `Catching up from block ${lastProcessedBlock + 1} to ${currentBlock}`
       );
 
-      let blockNumber = lastProcessedBlock;
+      let blockNumber = Number(lastProcessedBlock);
       while (blockNumber < currentBlock) {
         try {
           const length = Math.min(currentBlock - blockNumber, 1000);
           const blocks = await this.getBlocks(blockNumber, length);
           for (const block of blocks) {
+            console.log("Block", block.number);
             while (true) {
               try {
                 const needsRecalibration = await this.handleNewBlock(block);
                 if (needsRecalibration) {
-                  const latestFossilBlock =
-                    await this.db.getLatestFossilBlock();
-                  const latestBlock = latestFossilBlock ?? currentBlock;
-                  await Promise.all([
-                    this.db.initializeTWAPState("twelve_min", latestBlock),
-                    this.db.initializeTWAPState("three_hour", latestBlock),
-                    this.db.initializeTWAPState("thirty_day", latestBlock),
-                  ]);
-
-                  return this.initialize(); // Start over from getInitialState
+                    console.log("THIS")
+                  await this.recalibrate();
+                  return true; // Start over from getInitialState
                 }
                 break; // Success, move to next block
               } catch (error) {
@@ -74,10 +81,12 @@ export class Runner {
                 await this.sleep(1000); // Wait a second before retrying
               }
             }
+            console.log("BlockDone", block.number);
           }
 
-          currentBlock = Number(await this.viemClient.getBlockNumber());
+          currentBlock = Number(await this.rpcClient.getBlockNumber());
           blockNumber += length;
+          console.log("Current block", currentBlock);
         } catch (error) {
           console.error(`Error fetching blocks at ${blockNumber}:`, error);
           await this.sleep(1000); // Wait before retrying the batch
@@ -85,26 +94,42 @@ export class Runner {
         }
       }
     }
+    return false;
   }
-
 
   async getBlocks(fromBlock: number, length: number): Promise<Block[]> {
     const promises = Array.from({ length }, async (_, i) => {
-        const block = await this.viemClient.getBlock({
-          blockNumber: BigInt(fromBlock + i),
-        });
-        return block;
+      const block = await this.rpcClient.getBlock({
+        blockNumber: BigInt(fromBlock + i),
       });
-      const blocks = await Promise.all(promises);
-      blocks.sort((a, b) => Number(a.number) - Number(b.number));
+      return block;
+    });
+    const blocks = await Promise.all(promises);
+    blocks.sort((a, b) => Number(a.number) - Number(b.number));
     return blocks;
   }
 
-   startListening() {
+  async recalibrate() {
+    const currentBlock = Number(await this.rpcClient.getBlockNumber());
+    const latestFossilBlock = await this.db.getLatestFossilBlock();
+    const latestBlock = latestFossilBlock ?? currentBlock;
+    await Promise.all([
+      this.db.initializeTWAPState("twelve_min", latestBlock),
+      this.db.initializeTWAPState("three_hour", latestBlock),
+      this.db.initializeTWAPState("thirty_day", latestBlock),
+    ]);
+  }
+
+  startListening() {
     const unwatch = this.viemClient.watchBlocks({
       onBlock: async (block: Block) => {
         try {
-          await this.handleNewBlock(block);
+          const shouldRecalibrate = await this.handleNewBlock(block);
+          if (shouldRecalibrate) {
+            unwatch();
+            await this.initialize();
+            this.startListening();
+          }
         } catch (error) {
           console.error("Error handling new block:", error);
         }
@@ -164,7 +189,7 @@ export class Runner {
       timeWindow
     );
     // Fetch relevant blocks for the window
-    // If no historical blocks, use current block's 
+    // If no historical blocks, use current block's
     if (blocks.length === 0) {
       return {
         twap: currentBlock.basefee,

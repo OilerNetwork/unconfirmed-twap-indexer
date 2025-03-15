@@ -14,9 +14,7 @@ export class DB {
     });
     this.pitchlakePool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: {
-        rejectUnauthorized: false,
-      },
+      ssl: false
     });
   }
   async shutdown() {
