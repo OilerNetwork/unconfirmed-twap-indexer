@@ -18,7 +18,7 @@ export class Runner {
     this.db = new DB();
     this.viemClient = createPublicClient({
       chain: sepolia,
-      transport: webSocket(process.env.SEPOLIA_RPC_URL),
+      transport: webSocket(`wss://eth-sepolia.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`),
     });
   }
 
