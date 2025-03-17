@@ -128,6 +128,7 @@ export class Runner {
 
   startListening() {
     const unwatch = this.viemClient.watchBlocks({
+      poll:true,
       onBlock: async (block: Block) => {
         try {
           const shouldRecalibrate = await this.handleNewBlock(block);
