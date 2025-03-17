@@ -128,6 +128,7 @@ export class Runner {
 
   startListening() {
     const unwatch = this.viemClient.watchBlocks({
+      pollingInterval: 5000,
       poll:true,
       onBlock: async (block: Block) => {
         try {
