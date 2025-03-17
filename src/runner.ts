@@ -17,7 +17,6 @@ const TWAP_RANGES = {
 
 export class Runner {
   private db: DB;
-  private viemClient: PublicClient;
   private rpcClient: PublicClient;
   unwatch: WatchBlocksReturnType | undefined;
 
@@ -27,12 +26,6 @@ export class Runner {
       chain: mainnet,
       transport: http(
         `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
-      ),
-    });
-    this.viemClient = createPublicClient({
-      chain: mainnet,
-      transport: webSocket(
-        `wss://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
       ),
     });
   }
@@ -127,7 +120,7 @@ export class Runner {
   }
 
   startListening() {
-    const unwatch = this.viemClient.watchBlocks({
+    const unwatch = this.rpcClient.watchBlocks({
       pollingInterval: 5000,
       poll:true,
       onBlock: async (block: Block) => {
