@@ -6,4 +6,4 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/indexer
       - FOSSIL_DB_URL=postgresql://user:pass@fossil-db:5432/fossil
-      - ALCHEMY_API_KEY=${ALCHEMY_API_KEY}
+      - MAINNET_RPC_URL=${MAINNET_RPC_URL}
